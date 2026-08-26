@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import uuid
 from typing import Optional
@@ -10,7 +11,7 @@ import yt_dlp
 
 app = FastAPI(
     title="YouTube MP3 Converter & Live Streaming API",
-    description="Microservicio FastAPI para búsqueda, reproducción en vivo (streaming) y descarga de MP3 320kbps",
+    description="Microservicio FastAPI para búsqueda, reproducción en vivo (streaming MP3 en tiempo real) y descarga de MP3 320kbps",
     version="1.0.0"
 )
 
@@ -27,6 +28,8 @@ app.add_middleware(
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "api_audio_downloads")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 
 def cleanup_file(filepath: str):
     """Elimina el archivo temporal tras la descarga."""
@@ -41,7 +44,7 @@ def cleanup_file(filepath: str):
 def health_check():
     return {
         "status": "ok",
-        "service": "YouTube MP3 Streaming & Downloader API (FastAPI + yt-dlp + httpx)",
+        "service": "YouTube MP3 Streaming & Downloader API (FastAPI + yt-dlp + FFmpeg Pipe)",
         "version": "1.0.0"
     }
 
@@ -98,20 +101,20 @@ def search_tracks(
 
 
 @app.get("/api/stream")
-async def stream_audio_by_url(
+def stream_audio_by_url(
     url: str = Query(..., description="URL completa de YouTube o ID del video")
 ):
     """
-    Escucha la canción en tiempo real (Streaming Proxy).
-    Transmite los fragmentos de audio a través de FastAPI con soporte 100% completo de CORS.
-    Funciona en Swagger UI (/docs), fetch(), etiquetas <audio> y aplicaciones móviles.
+    Escucha la canción en tiempo real (FFmpeg Pipe MP3 Streaming).
+    Transmite tramas de audio MP3 (audio/mpeg) en tiempo real sin guardar archivos en disco.
+    Compatible con reproductores iOS, Android, HTML5 y Swagger UI.
     """
     clean_url = url.strip()
     if len(clean_url) == 11 and not clean_url.startswith("http"):
         clean_url = f"https://www.youtube.com/watch?v={clean_url}"
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "m4a/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
     }
@@ -122,23 +125,39 @@ async def stream_audio_by_url(
             direct_audio_url = info.get("url") if info else None
 
             if not direct_audio_url:
-                raise HTTPException(status_code=404, detail="No se pudo resolver el enlace de audio")
+                raise HTTPException(status_code=404, detail="No se pudo resolver el flujo de audio de YouTube")
 
-            # Crear cliente httpx asíncrono para transmitir el flujo de audio
-            client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
-            req = client.build_request("GET", direct_audio_url)
-            r = await client.send(req, stream=True)
+            # Ejecutar FFmpeg en tubería (pipe) para convertir el flujo en vivo a MP3 genuino (audio/mpeg)
+            cmd = [
+                "ffmpeg",
+                "-headers", f"User-Agent: {USER_AGENT}\r\n",
+                "-i", direct_audio_url,
+                "-f", "mp3",
+                "-b:a", "192k",
+                "-vn",
+                "pipe:1"
+            ]
 
-            async def chunk_generator():
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=65536
+            )
+
+            def iterfile():
                 try:
-                    async for chunk in r.aiter_bytes(chunk_size=65536):
-                        yield chunk
+                    while True:
+                        data = process.stdout.read(65536)
+                        if not data:
+                            break
+                        yield data
                 finally:
-                    await r.aclose()
-                    await client.aclose()
+                    if process.poll() is None:
+                        process.kill()
 
             return StreamingResponse(
-                chunk_generator(),
+                iterfile(),
                 media_type="audio/mpeg",
                 headers={
                     "Accept-Ranges": "bytes",
@@ -149,7 +168,7 @@ async def stream_audio_by_url(
                 }
             )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error transmitiendo audio: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en streaming MP3: {str(e)}")
 
 
 @app.get("/api/download")
