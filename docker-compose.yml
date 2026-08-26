@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  audio-api:
+    build: .
+    container_name: fast_youtube_mp3_api
+    ports:
+      - "8000:8000"
+    restart: always
+    environment:
+      - PORT=8000
