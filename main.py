@@ -2,9 +2,10 @@ import os
 import tempfile
 import uuid
 from typing import Optional
+import httpx
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import yt_dlp
 
 app = FastAPI(
@@ -13,13 +14,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Habilitar CORS para peticiones desde aplicaciones móviles y navegadores web
+# Habilitar CORS completo para peticiones desde navegadores, Swagger UI y aplicaciones móviles
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "api_audio_downloads")
@@ -39,7 +41,7 @@ def cleanup_file(filepath: str):
 def health_check():
     return {
         "status": "ok",
-        "service": "YouTube MP3 Streaming & Downloader API (FastAPI + yt-dlp)",
+        "service": "YouTube MP3 Streaming & Downloader API (FastAPI + yt-dlp + httpx)",
         "version": "1.0.0"
     }
 
@@ -96,12 +98,13 @@ def search_tracks(
 
 
 @app.get("/api/stream")
-def stream_audio_by_url(
+async def stream_audio_by_url(
     url: str = Query(..., description="URL completa de YouTube o ID del video")
 ):
     """
-    Escucha la canción en tiempo real sin descargar ningún archivo a disco.
-    Extrae el flujo directo de audio en milisegundos y redirige el reproductor al instante.
+    Escucha la canción en tiempo real (Streaming Proxy).
+    Transmite los fragmentos de audio a través de FastAPI con soporte 100% completo de CORS.
+    Funciona en Swagger UI (/docs), fetch(), etiquetas <audio> y aplicaciones móviles.
     """
     clean_url = url.strip()
     if len(clean_url) == 11 and not clean_url.startswith("http"):
@@ -119,12 +122,34 @@ def stream_audio_by_url(
             direct_audio_url = info.get("url") if info else None
 
             if not direct_audio_url:
-                raise HTTPException(status_code=404, detail="No se pudo resolver el enlace de streaming de audio")
+                raise HTTPException(status_code=404, detail="No se pudo resolver el enlace de audio")
 
-            # Redirección 307 al flujo de audio de alta velocidad
-            return RedirectResponse(url=direct_audio_url, status_code=307)
+            # Crear cliente httpx asíncrono para transmitir el flujo de audio
+            client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+            req = client.build_request("GET", direct_audio_url)
+            r = await client.send(req, stream=True)
+
+            async def chunk_generator():
+                try:
+                    async for chunk in r.aiter_bytes(chunk_size=65536):
+                        yield chunk
+                finally:
+                    await r.aclose()
+                    await client.aclose()
+
+            return StreamingResponse(
+                chunk_generator(),
+                media_type="audio/mpeg",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Type": "audio/mpeg",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error obteniendo streaming de audio: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error transmitiendo audio: {str(e)}")
 
 
 @app.get("/api/download")
